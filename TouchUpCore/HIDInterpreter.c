@@ -18,6 +18,10 @@
 
 #define kMaxTouchscreens 4
 
+// Upper bound on elements one report can carry; 10 contacts x 4 usages plus scan time and
+// contact count fit comfortably.
+#define kMaxUpdatedCookies 256
+
 typedef struct {
     IOHIDDeviceRef          device;     // unique identity of this HID interface
     uint32_t                locationID; // shared across interfaces of the same USB device
@@ -43,6 +47,14 @@ typedef struct {
     CFIndex                 contactCount;
     CFIndex                 hybridOffset;
     Boolean                 touchscreenUsesHybridMode;
+
+    /**
+     Cookies of the elements that carried data in the report currently being assembled.
+     A collection whose elements are all absent from this list reported nothing this
+     report, so its stored values are stale and must not be dispatched.
+     */
+    int64_t                 updatedCookies[kMaxUpdatedCookies];
+    int                     updatedCookieCount;
 } HIDDeviceState;
 
 static HIDDeviceState gDevices[kMaxTouchscreens];
@@ -243,6 +255,28 @@ CFIndex ValueOfElement(HIDDeviceState *device, IOHIDElementRef element) {
 
 
 
+/*!
+ Records that an element carried data in the report being assembled. Cleared once the
+ report is dispatched, so the list always describes just the current report.
+ */
+static void MarkCookieUpdated(HIDDeviceState *device, int64_t cookie) {
+    for (int i = 0; i < device->updatedCookieCount; i++) {
+        if (device->updatedCookies[i] == cookie) return;
+    }
+    if (device->updatedCookieCount < kMaxUpdatedCookies) {
+        device->updatedCookies[device->updatedCookieCount++] = cookie;
+    }
+}
+
+
+static Boolean IsCookieUpdated(HIDDeviceState *device, int64_t cookie) {
+    for (int i = 0; i < device->updatedCookieCount; i++) {
+        if (device->updatedCookies[i] == cookie) return TRUE;
+    }
+    return FALSE;
+}
+
+
 void StoreInputValue(HIDDeviceState *device, IOHIDValueRef hidValue) {
     
     CFIndex value = IOHIDValueGetIntegerValue(hidValue);
@@ -255,7 +289,9 @@ void StoreInputValue(HIDDeviceState *device, IOHIDValueRef hidValue) {
     CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberCFIndexType, &value);
     
     CFDictionarySetValue(device->storedInputValues, key, num);
-    
+
+    MarkCookieUpdated(device, keyValue);
+
     CFRelease(num);
     CFRelease(key);
     
@@ -425,14 +461,18 @@ void PrintTouchCollection(HIDDeviceState *device, IOHIDElementRef collection) {
  Dispatches touch data for the given collection, but only if all values needed were received
  */
 
-void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef collection) {
+void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef collection, CFIndex collectionIndex) {
     
     CFArrayRef children = IOHIDElementGetChildren(collection);
     
     CGFloat x = -1;
     CGFloat y = -1;
     
-    CFIndex contactID = 0;
+    // Default to the collection's own index rather than 0: a device need not send a
+    // ContactIdentifier for every contact (the HID queue only delivers elements whose value
+    // changed), and leaving every such contact at 0 collapses separate fingers onto one
+    // touch. The slot index is stable and unique, so it stands in until a real ID arrives.
+    CFIndex contactID = collectionIndex;
     CFIndex tipSwitch = 0;
     CFIndex isValid = 0;
     
@@ -440,6 +480,11 @@ void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef coll
     CFIndex height  = kCFNotFound;
     CFIndex azimuth = kCFNotFound;
     
+    // A collection reports nothing when its contact is absent from this report. Its stored
+    // values then belong to an earlier report and would resurrect a finger that is long
+    // gone, so only collections touched by the current report are dispatched.
+    Boolean collectionReportedThisFrame = FALSE;
+
     // get stored values of all touches
     for (CFIndex i=0; i<CFArrayGetCount(children); i++) {
         IOHIDElementRef element = (IOHIDElementRef)CFArrayGetValueAtIndex(children, i);
@@ -447,6 +492,10 @@ void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef coll
         CFIndex page = IOHIDElementGetUsagePage(element);
         CFIndex usage = IOHIDElementGetUsage(element);
         CFIndex value = ValueOfElement(device, element);
+
+        if (IsCookieUpdated(device, StorageKeyForElement(element))) {
+            collectionReportedThisFrame = TRUE;
+        }
         
         if (value != kCFNotFound) {
             if (page == kHIDPage_GenericDesktop) {
@@ -482,6 +531,10 @@ void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef coll
             } // kHIDPage_Digitizer
         }
     }
+    if (!collectionReportedThisFrame) {
+        return;
+    }
+
     TouchInputManagerUpdateTouchPosition(gTouchManager, device->locationID, contactID, x, y, (int)tipSwitch, (int)isValid);
     
     //    if (width != kCFNotFound && height != kCFNotFound && azimuth != kCFNotFound) {
@@ -509,7 +562,7 @@ void DispatchTouches(HIDDeviceState *device) {
     // update the touch data
     for (CFIndex i=0; i<numElementsToPost; i++) {
         IOHIDElementRef collection = (IOHIDElementRef)CFArrayGetValueAtIndex(device->touchCollectionElements, i);
-        DispatchTouchDataForCollection(device, collection);
+        DispatchTouchDataForCollection(device, collection, i);
     }
     
     device->hybridOffset = device->hybridOffset + numUpdates;
@@ -521,7 +574,9 @@ void DispatchTouches(HIDDeviceState *device) {
     if (device->hybridOffset == 0) {
         TouchInputManagerDidProcessReport(gTouchManager, device->locationID);
     }
-    
+
+    // The report is done; the next one starts with a clean slate.
+    device->updatedCookieCount = 0;
 }
 
 

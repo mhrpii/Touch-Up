@@ -531,7 +531,11 @@ void DispatchTouchDataForCollection(HIDDeviceState *device, IOHIDElementRef coll
             } // kHIDPage_Digitizer
         }
     }
-    if (!collectionReportedThisFrame) {
+    // Dispatch a collection when it carried data this report, or when its contact is still
+    // down: a device sends nothing for a finger that rests perfectly still, and starving
+    // those updates would stop the touch from ever being seen as stationary. A collection
+    // that is silent with its tip up holds only stale values, so it stays skipped.
+    if (!collectionReportedThisFrame && tipSwitch != 1) {
         return;
     }
 
